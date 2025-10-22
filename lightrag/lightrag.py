@@ -9,6 +9,7 @@ import warnings
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from functools import partial
+from collections import defaultdict
 from typing import (
     Any,
     AsyncIterator,
@@ -1065,7 +1066,7 @@ class LightRAG:
 
     def insert(
         self,
-        input: str | list[str],
+        input: str | dict[str, Any] | list[str | dict[str, Any]],
         split_by_character: str | None = None,
         split_by_character_only: bool = False,
         ids: str | list[str] | None = None,
@@ -1075,7 +1076,8 @@ class LightRAG:
         """Sync Insert documents with checkpoint support
 
         Args:
-            input: Single document string or list of document strings
+            input: Single document string, document dict (`{"content": ..., "metadata": ..., "manual_graph": ...}`),
+                or a list combining those forms.
             split_by_character: if split_by_character is not None, split the string by character, if chunk longer than
             chunk_token_size, it will be split again by token size.
             split_by_character_only: if split_by_character_only is True, split the string by character only, when
@@ -1101,7 +1103,7 @@ class LightRAG:
 
     async def ainsert(
         self,
-        input: str | list[str],
+        input: str | dict[str, Any] | list[str | dict[str, Any]],
         split_by_character: str | None = None,
         split_by_character_only: bool = False,
         ids: str | list[str] | None = None,
@@ -1111,7 +1113,8 @@ class LightRAG:
         """Async Insert documents with checkpoint support
 
         Args:
-            input: Single document string or list of document strings
+            input: Single document string, document dict (`{"content": ..., "metadata": ..., "manual_graph": ...}`),
+                or a list combining those forms.
             split_by_character: if split_by_character is not None, split the string by character, if chunk longer than
             chunk_token_size, it will be split again by token size.
             split_by_character_only: if split_by_character_only is True, split the string by character only, when
@@ -1208,7 +1211,7 @@ class LightRAG:
 
     async def apipeline_enqueue_documents(
         self,
-        input: str | list[str],
+        input: str | dict[str, Any] | list[str | dict[str, Any]],
         ids: list[str] | None = None,
         file_paths: str | list[str] | None = None,
         track_id: str | None = None,
@@ -1222,7 +1225,8 @@ class LightRAG:
         4. Enqueue document in status
 
         Args:
-            input: Single document string or list of document strings
+            input: Single document string, document dict (`{"content": ..., "metadata": ..., "manual_graph": ...}`),
+                or a list combining those forms.
             ids: list of unique document IDs, if not provided, MD5 hash IDs will be generated
             file_paths: list of file paths corresponding to each document, used for citation
             track_id: tracking ID for monitoring processing status, if not provided, will be generated with "enqueue" prefix
@@ -1233,62 +1237,122 @@ class LightRAG:
         # Generate track_id if not provided
         if track_id is None or track_id.strip() == "":
             track_id = generate_track_id("enqueue")
-        if isinstance(input, str):
-            input = [input]
+
+        # Normalize input documents
+        if isinstance(input, (str, dict)):
+            input_seq: list[str | dict[str, Any]] = [input]
+        elif isinstance(input, list):
+            input_seq = input
+        else:
+            raise TypeError(
+                "input must be a string, a document dict, or a list of those types"
+            )
+
+        normalized_docs: list[dict[str, Any]] = []
+        for raw_doc in input_seq:
+            if isinstance(raw_doc, str):
+                normalized_docs.append(
+                    {
+                        "content": raw_doc,
+                        "metadata": None,
+                        "manual_graph": None,
+                        "chunk_overrides": None,
+                        "file_path": None,
+                    }
+                )
+            elif isinstance(raw_doc, dict):
+                content_value = raw_doc.get("content")
+                if not isinstance(content_value, str):
+                    raise ValueError(
+                        "Document dicts must include a string 'content' field"
+                    )
+                normalized_docs.append(
+                    {
+                        "content": content_value,
+                        "metadata": raw_doc.get("metadata"),
+                        "manual_graph": raw_doc.get("manual_graph"),
+                        "chunk_overrides": raw_doc.get("chunk_overrides")
+                        or raw_doc.get("chunk_metadata"),
+                        "file_path": raw_doc.get("file_path"),
+                    }
+                )
+            else:
+                raise TypeError(
+                    "input list items must be strings or document dicts with 'content'"
+                )
+
         if isinstance(ids, str):
             ids = [ids]
         if isinstance(file_paths, str):
             file_paths = [file_paths]
 
+        doc_count = len(normalized_docs)
+
         # If file_paths is provided, ensure it matches the number of documents
         if file_paths is not None:
-            if isinstance(file_paths, str):
-                file_paths = [file_paths]
-            if len(file_paths) != len(input):
+            if len(file_paths) != doc_count:
                 raise ValueError(
                     "Number of file paths must match the number of documents"
                 )
+            fallback_paths = list(file_paths)
         else:
             # If no file paths provided, use placeholder
-            file_paths = ["unknown_source"] * len(input)
+            fallback_paths = ["unknown_source"] * doc_count
+
+        sanitized_docs: list[dict[str, Any]] = []
+        for doc_data, fallback_path in zip(normalized_docs, fallback_paths):
+            cleaned_content = sanitize_text_for_encoding(doc_data["content"])
+            sanitized_docs.append(
+                {
+                    "content": cleaned_content,
+                    "file_path": doc_data.get("file_path") or fallback_path,
+                    "metadata": doc_data.get("metadata"),
+                    "manual_graph": doc_data.get("manual_graph"),
+                    "chunk_overrides": doc_data.get("chunk_overrides"),
+                }
+            )
 
         # 1. Validate ids if provided or generate MD5 hash IDs and remove duplicate contents
         if ids is not None:
-            # Check if the number of IDs matches the number of documents
-            if len(ids) != len(input):
+            if len(ids) != doc_count:
                 raise ValueError("Number of IDs must match the number of documents")
 
             # Check if IDs are unique
             if len(ids) != len(set(ids)):
                 raise ValueError("IDs must be unique")
 
-            # Generate contents dict and remove duplicates in one pass
-            unique_contents = {}
-            for id_, doc, path in zip(ids, input, file_paths):
-                cleaned_content = sanitize_text_for_encoding(doc)
-                if cleaned_content not in unique_contents:
-                    unique_contents[cleaned_content] = (id_, path)
+            unique_contents: dict[str, tuple[str, dict[str, Any]]] = {}
+            for id_, doc_data in zip(ids, sanitized_docs):
+                content_value = doc_data["content"]
+                if content_value not in unique_contents:
+                    unique_contents[content_value] = (id_, doc_data)
 
-            # Reconstruct contents with unique content
             contents = {
-                id_: {"content": content, "file_path": file_path}
-                for content, (id_, file_path) in unique_contents.items()
+                doc_id: {
+                    "content": doc_data["content"],
+                    "file_path": doc_data["file_path"],
+                    "metadata": doc_data.get("metadata"),
+                    "manual_graph": doc_data.get("manual_graph"),
+                    "chunk_overrides": doc_data.get("chunk_overrides"),
+                }
+                for _, (doc_id, doc_data) in unique_contents.items()
             }
         else:
-            # Clean input text and remove duplicates in one pass
-            unique_content_with_paths = {}
-            for doc, path in zip(input, file_paths):
-                cleaned_content = sanitize_text_for_encoding(doc)
-                if cleaned_content not in unique_content_with_paths:
-                    unique_content_with_paths[cleaned_content] = path
+            unique_content_with_payload: dict[str, dict[str, Any]] = {}
+            for doc_data in sanitized_docs:
+                content_value = doc_data["content"]
+                if content_value not in unique_content_with_payload:
+                    unique_content_with_payload[content_value] = doc_data
 
-            # Generate contents dict of MD5 hash IDs and documents with paths
             contents = {
-                compute_mdhash_id(content, prefix="doc-"): {
-                    "content": content,
-                    "file_path": path,
+                compute_mdhash_id(content_value, prefix="doc-"): {
+                    "content": content_value,
+                    "file_path": payload["file_path"],
+                    "metadata": payload.get("metadata"),
+                    "manual_graph": payload.get("manual_graph"),
+                    "chunk_overrides": payload.get("chunk_overrides"),
                 }
-                for content, path in unique_content_with_paths.items()
+                for content_value, payload in unique_content_with_payload.items()
             }
 
         # 2. Generate document initial status (without content)
@@ -1339,13 +1403,20 @@ class LightRAG:
 
         # 4. Store document content in full_docs and status in doc_status
         #    Store full document content separately
-        full_docs_data = {
-            doc_id: {
-                "content": contents[doc_id]["content"],
-                "file_path": contents[doc_id]["file_path"],
+        full_docs_data: dict[str, dict[str, Any]] = {}
+        for doc_id in new_docs.keys():
+            content_payload = contents[doc_id]
+            doc_entry = {
+                "content": content_payload["content"],
+                "file_path": content_payload["file_path"],
             }
-            for doc_id in new_docs.keys()
-        }
+            if content_payload.get("metadata") is not None:
+                doc_entry["metadata"] = content_payload.get("metadata")
+            if content_payload.get("manual_graph") is not None:
+                doc_entry["manual_graph"] = content_payload.get("manual_graph")
+            if content_payload.get("chunk_overrides") is not None:
+                doc_entry["chunk_overrides"] = content_payload.get("chunk_overrides")
+            full_docs_data[doc_id] = doc_entry
         await self.full_docs.upsert(full_docs_data)
         # Persist data to disk immediately
         await self.full_docs.index_done_callback()
@@ -1745,6 +1816,156 @@ class LightRAG:
                                 )
                             }
 
+                            doc_metadata = content_data.get("metadata")
+                            doc_manual_graph = content_data.get("manual_graph")
+                            doc_chunk_overrides = content_data.get("chunk_overrides")
+
+                            graph_keys = {
+                                "entities",
+                                "nodes",
+                                "relations",
+                                "relationships",
+                                "edges",
+                            }
+
+                            def _merge_manual_graph_dict(
+                                existing: Any, incoming: Any
+                            ) -> dict[str, Any] | None:
+                                if not isinstance(incoming, dict):
+                                    return existing if isinstance(existing, dict) else None
+
+                                if not isinstance(existing, dict):
+                                    return dict(incoming)
+
+                                merged = dict(existing)
+                                for key, value in incoming.items():
+                                    if (
+                                        key in graph_keys
+                                        and isinstance(value, list)
+                                        and isinstance(merged.get(key), list)
+                                    ):
+                                        merged[key] = merged[key] + value
+                                    elif key in graph_keys and isinstance(value, list):
+                                        merged[key] = list(value)
+                                    else:
+                                        merged[key] = value
+                                return merged
+
+                            def _resolve_metadata(source: Any, index: int) -> Any:
+                                if source is None:
+                                    return None
+                                if isinstance(source, list):
+                                    return source[index] if index < len(source) else None
+                                return source
+
+                            def _resolve_manual_graph(
+                                source: Any, index: int, chunk_key: str
+                            ) -> Any:
+                                if source is None:
+                                    return None
+                                if isinstance(source, list):
+                                    return source[index] if index < len(source) else None
+                                if isinstance(source, dict):
+                                    if graph_keys.intersection(source.keys()):
+                                        return source
+                                    if chunk_key in source:
+                                        return source[chunk_key]
+                                    key_str = str(index)
+                                    if key_str in source:
+                                        return source[key_str]
+                                    if index in source:
+                                        return source[index]
+                                    if "default" in source:
+                                        return source["default"]
+                                return None
+
+                            def _resolve_chunk_override(
+                                source: Any, index: int, chunk_key: str
+                            ) -> Any:
+                                if source is None:
+                                    return None
+                                if isinstance(source, list):
+                                    return source[index] if index < len(source) else None
+                                if isinstance(source, dict):
+                                    if chunk_key in source:
+                                        return source[chunk_key]
+                                    key_str = str(index)
+                                    if key_str in source:
+                                        return source[key_str]
+                                    if index in source:
+                                        return source[index]
+                                    if "default" in source:
+                                        return source["default"]
+                                    return source
+                                return source
+
+                            for idx, (chunk_id, chunk_payload) in enumerate(
+                                chunks.items()
+                            ):
+                                chunk_payload.setdefault("chunk_id", chunk_id)
+
+                                metadata_value = _resolve_metadata(doc_metadata, idx)
+                                if metadata_value is not None:
+                                    existing_metadata = chunk_payload.get("metadata")
+                                    if isinstance(existing_metadata, dict) and isinstance(
+                                        metadata_value, dict
+                                    ):
+                                        chunk_payload["metadata"] = {
+                                            **metadata_value,
+                                            **existing_metadata,
+                                        }
+                                    elif existing_metadata is None:
+                                        chunk_payload["metadata"] = metadata_value
+
+                                manual_graph_value = _resolve_manual_graph(
+                                    doc_manual_graph, idx, chunk_id
+                                )
+                                if isinstance(manual_graph_value, dict):
+                                    merged_graph = _merge_manual_graph_dict(
+                                        chunk_payload.get("manual_graph"),
+                                        manual_graph_value,
+                                    )
+                                    if merged_graph is not None:
+                                        chunk_payload["manual_graph"] = merged_graph
+
+                                overrides_value = _resolve_chunk_override(
+                                    doc_chunk_overrides, idx, chunk_id
+                                )
+                                if isinstance(overrides_value, dict):
+                                    metadata_override = overrides_value.get("metadata")
+                                    if metadata_override is not None:
+                                        existing_metadata = chunk_payload.get("metadata")
+                                        if isinstance(
+                                            existing_metadata, dict
+                                        ) and isinstance(metadata_override, dict):
+                                            chunk_payload["metadata"] = {
+                                                **existing_metadata,
+                                                **metadata_override,
+                                            }
+                                        else:
+                                            chunk_payload["metadata"] = metadata_override
+
+                                    override_manual_graph = overrides_value.get(
+                                        "manual_graph"
+                                    )
+                                    if isinstance(override_manual_graph, dict):
+                                        merged_graph = _merge_manual_graph_dict(
+                                            chunk_payload.get("manual_graph"),
+                                            override_manual_graph,
+                                        )
+                                        if merged_graph is not None:
+                                            chunk_payload["manual_graph"] = merged_graph
+
+                                    for key, value in overrides_value.items():
+                                        if key in {"metadata", "manual_graph"}:
+                                            continue
+                                        if value is not None and key not in chunk_payload:
+                                            chunk_payload[key] = value
+                                elif overrides_value is not None:
+                                    # Allow overrides_value to directly replace metadata if nothing else provided
+                                    if "metadata" not in chunk_payload:
+                                        chunk_payload["metadata"] = overrides_value
+
                             if not chunks:
                                 logger.warning("No document chunks to process")
 
@@ -2009,6 +2230,120 @@ class LightRAG:
                 pipeline_status["latest_message"] = log_message
                 pipeline_status["history_messages"].append(log_message)
 
+    def _prepare_manual_graph(
+        self,
+        chunk_id: str,
+        chunk_payload: dict[str, Any],
+        manual_graph: dict[str, Any],
+    ) -> tuple[dict[str, list[dict[str, Any]]], dict[tuple[str, str], list[dict[str, Any]]]]:
+        """Normalize manual graph data attached to a chunk into the internal format."""
+        file_path = chunk_payload.get("file_path", "unknown_source")
+        timestamp = int(time.time())
+
+        nodes: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        edges: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+
+        manual_entities = manual_graph.get("entities") or manual_graph.get("nodes") or []
+        for entity in manual_entities:
+            if not isinstance(entity, dict):
+                logger.warning(
+                    "Manual entity for chunk %s must be a dict, skipping invalid entry",
+                    chunk_id,
+                )
+                continue
+
+            raw_name = entity.get("entity_name") or entity.get("name")
+            raw_description = entity.get("description")
+            if not raw_name or not raw_description:
+                logger.warning(
+                    "Manual entity for chunk %s missing name or description, skipping",
+                    chunk_id,
+                )
+                continue
+
+            entity_name = str(raw_name).strip()
+            entity_type = str(
+                entity.get("entity_type") or entity.get("type") or "unknown"
+            ).replace(" ", "").lower()
+            normalized_entity = dict(entity)
+            normalized_entity.update(
+                {
+                    "entity_name": entity_name,
+                    "entity_type": entity_type,
+                    "description": str(raw_description),
+                    "source_id": str(entity.get("source_id") or chunk_id),
+                    "file_path": entity.get("file_path", file_path),
+                    "timestamp": entity.get("timestamp", timestamp),
+                }
+            )
+            nodes[entity_name].append(normalized_entity)
+
+        manual_relations = (
+            manual_graph.get("relations")
+            or manual_graph.get("relationships")
+            or manual_graph.get("edges")
+            or []
+        )
+        for relation in manual_relations:
+            if not isinstance(relation, dict):
+                logger.warning(
+                    "Manual relation for chunk %s must be a dict, skipping invalid entry",
+                    chunk_id,
+                )
+                continue
+
+            raw_source = (
+                relation.get("src_id")
+                or relation.get("source")
+                or relation.get("from")
+                or relation.get("start")
+            )
+            raw_target = (
+                relation.get("tgt_id")
+                or relation.get("target")
+                or relation.get("to")
+                or relation.get("end")
+            )
+            raw_description = relation.get("description")
+            if not raw_source or not raw_target or not raw_description:
+                logger.warning(
+                    "Manual relation for chunk %s missing source, target, or description, skipping",
+                    chunk_id,
+                )
+                continue
+
+            keywords = relation.get("keywords") or relation.get("labels") or ""
+            weight_raw = relation.get("weight", 1.0)
+            try:
+                weight = float(weight_raw)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Manual relation weight for chunk %s is invalid (%s); defaulting to 1.0",
+                    chunk_id,
+                    weight_raw,
+                )
+                weight = 1.0
+
+            source = str(raw_source).strip()
+            target = str(raw_target).strip()
+
+            normalized_relation = dict(relation)
+            normalized_relation.update(
+                {
+                    "src_id": source,
+                    "tgt_id": target,
+                    "description": str(raw_description),
+                    "keywords": str(keywords),
+                    "weight": weight,
+                    "source_id": relation.get("source_id", chunk_id),
+                    "file_path": relation.get("file_path", file_path),
+                    "timestamp": relation.get("timestamp", timestamp),
+                }
+            )
+            edges[(source, target)].append(normalized_relation)
+
+        return dict(nodes), dict(edges)
+
     async def _process_extract_entities(
         self, chunk: dict[str, Any], pipeline_status=None, pipeline_status_lock=None
     ) -> list:
@@ -2021,6 +2356,52 @@ class LightRAG:
                 llm_response_cache=self.llm_response_cache,
                 text_chunks_storage=self.text_chunks,
             )
+            chunk_results = list(chunk_results or [])
+
+            chunk_items = list(chunk.items())
+            # Ensure we have slots for manual graph data even if extraction fails for a chunk
+            while len(chunk_results) < len(chunk_items):
+                chunk_results.append(({}, {}))
+
+            manual_graph_chunks = 0
+            for idx, (chunk_id, chunk_payload) in enumerate(chunk_items):
+                manual_graph = chunk_payload.get("manual_graph")
+                if not manual_graph:
+                    continue
+                if not isinstance(manual_graph, dict):
+                    logger.warning(
+                        "Manual graph attached to chunk %s must be a dict, skipping",
+                        chunk_id,
+                    )
+                    continue
+
+                manual_nodes, manual_edges = self._prepare_manual_graph(
+                    chunk_id, chunk_payload, manual_graph
+                )
+                if not manual_nodes and not manual_edges:
+                    continue
+
+                # Ensure chunk_results has a container for this chunk
+                if idx >= len(chunk_results):
+                    chunk_results.append(({}, {}))
+
+                nodes_dict, edges_dict = chunk_results[idx]
+
+                if manual_nodes:
+                    for entity_name, entities in manual_nodes.items():
+                        nodes_dict.setdefault(entity_name, []).extend(entities)
+
+                if manual_edges:
+                    for edge_key, relations in manual_edges.items():
+                        edges_dict.setdefault(edge_key, []).extend(relations)
+
+                manual_graph_chunks += 1
+
+            if manual_graph_chunks:
+                logger.info(
+                    "Attached manual graph data to %d chunk(s)", manual_graph_chunks
+                )
+
             return chunk_results
         except Exception as e:
             error_msg = f"Failed to extract entities and relationships: {str(e)}"
