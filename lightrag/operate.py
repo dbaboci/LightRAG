@@ -2674,6 +2674,44 @@ async def extract_entities(
                     # New edge from gleaning stage
                     maybe_edges[edge_key] = list(glean_edges)
 
+        # Auto-link extracted entities to the article (neni) the chunk belongs to
+        chunk_metadata = chunk_dp.get("metadata")
+        neni_name: str | None = None
+        if isinstance(chunk_metadata, dict):
+            raw_neni_name = chunk_metadata.get("neni_name")
+            if isinstance(raw_neni_name, str):
+                stripped_neni_name = raw_neni_name.strip()
+                if stripped_neni_name:
+                    neni_name = stripped_neni_name
+
+        if neni_name:
+            for entity_name in list(maybe_nodes.keys()):
+                if entity_name == neni_name:
+                    continue
+
+                edge_key = (entity_name, neni_name)
+                existing_edges = maybe_edges.get(edge_key, [])
+                has_part_of = any(
+                    edge.get("description") == "part_of"
+                    and edge.get("tgt_id") == neni_name
+                    for edge in existing_edges
+                )
+
+                if not has_part_of:
+                    maybe_edges.setdefault(edge_key, []).append(
+                        {
+                            "src_id": entity_name,
+                            "tgt_id": neni_name,
+                            "weight": 1.0,
+                            "description": "part_of",
+                            "keywords": "part_of",
+                            "relation_type": "part_of",
+                            "source_id": chunk_key,
+                            "file_path": file_path,
+                            "timestamp": timestamp,
+                        }
+                    )
+
         # Batch update chunk's llm_cache_list with all collected cache keys
         if cache_keys_collector and text_chunks_storage:
             await update_chunk_cache_list(

@@ -22,7 +22,6 @@ from typing import (
     List,
     Dict,
 )
-from pathlib import Path
 from lightrag.prompt import PROMPTS
 from lightrag.constants import (
     DEFAULT_MAX_GLEANING,
