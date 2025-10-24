@@ -1927,6 +1927,10 @@ class LightRAG:
                                     )
                                     if merged_graph is not None:
                                         chunk_payload["manual_graph"] = merged_graph
+                                        logger.info(
+                                            "Doc-level manual graph applied to chunk %s (source=doc)",
+                                            chunk_id,
+                                        )
 
                                 overrides_value = _resolve_chunk_override(
                                     doc_chunk_overrides, idx, chunk_id
@@ -1955,6 +1959,11 @@ class LightRAG:
                                         )
                                         if merged_graph is not None:
                                             chunk_payload["manual_graph"] = merged_graph
+                                            logger.info(
+                                                "Chunk override manual graph applied to chunk %s (source=%s)",
+                                                chunk_id,
+                                                chunk_id,
+                                            )
 
                                     for key, value in overrides_value.items():
                                         if key in {"metadata", "manual_graph"}:
@@ -2396,6 +2405,19 @@ class LightRAG:
                         edges_dict.setdefault(edge_key, []).extend(relations)
 
                 manual_graph_chunks += 1
+                try:
+                    manual_node_names = list(manual_nodes.keys())
+                    manual_edge_pairs = [f"{src}->{tgt}" for src, tgt in manual_edges.keys()]
+                    logger.info(
+                        "Manual graph detected for chunk %s | nodes=%s | edges=%s",
+                        chunk_id,
+                        manual_node_names,
+                        manual_edge_pairs,
+                    )
+                except Exception:  # pragma: no cover - best-effort diagnostics
+                    logger.exception(
+                        "Failed to log manual graph contents for chunk %s", chunk_id
+                    )
 
             if manual_graph_chunks:
                 logger.info(

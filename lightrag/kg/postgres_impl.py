@@ -1729,6 +1729,29 @@ class PGKVStorage(BaseKVStorage):
             response["create_time"] = create_time
             response["update_time"] = create_time if update_time == 0 else update_time
 
+        if response and is_namespace(self.namespace, NameSpace.KV_STORE_FULL_DOCS):
+            meta_value = response.get("meta")
+            meta_obj: dict[str, Any] | None = None
+            if isinstance(meta_value, str):
+                try:
+                    meta_obj = json.loads(meta_value)
+                except json.JSONDecodeError:
+                    meta_obj = None
+            elif isinstance(meta_value, dict):
+                meta_obj = meta_value
+
+            if isinstance(meta_obj, dict):
+                metadata = meta_obj.get("metadata")
+                manual_graph = meta_obj.get("manual_graph")
+                chunk_overrides = meta_obj.get("chunk_overrides")
+                if metadata is not None:
+                    response["metadata"] = metadata
+                if manual_graph is not None:
+                    response["manual_graph"] = manual_graph
+                if chunk_overrides is not None:
+                    response["chunk_overrides"] = chunk_overrides
+            response.pop("meta", None)
+
         # Special handling for LLM cache to ensure compatibility with _get_cached_extraction_results
         if response and is_namespace(
             self.namespace, NameSpace.KV_STORE_LLM_RESPONSE_CACHE
@@ -1862,6 +1885,30 @@ class PGKVStorage(BaseKVStorage):
                 update_time = result.get("update_time", 0)
                 result["create_time"] = create_time
                 result["update_time"] = create_time if update_time == 0 else update_time
+
+        if results and is_namespace(self.namespace, NameSpace.KV_STORE_FULL_DOCS):
+            for result in results:
+                meta_value = result.get("meta")
+                meta_obj: dict[str, Any] | None = None
+                if isinstance(meta_value, str):
+                    try:
+                        meta_obj = json.loads(meta_value)
+                    except json.JSONDecodeError:
+                        meta_obj = None
+                elif isinstance(meta_value, dict):
+                    meta_obj = meta_value
+
+                if isinstance(meta_obj, dict):
+                    metadata = meta_obj.get("metadata")
+                    manual_graph = meta_obj.get("manual_graph")
+                    chunk_overrides = meta_obj.get("chunk_overrides")
+                    if metadata is not None:
+                        result["metadata"] = metadata
+                    if manual_graph is not None:
+                        result["manual_graph"] = manual_graph
+                    if chunk_overrides is not None:
+                        result["chunk_overrides"] = chunk_overrides
+                result.pop("meta", None)
 
         # Special handling for LLM cache to ensure compatibility with _get_cached_extraction_results
         if results and is_namespace(
@@ -2007,10 +2054,18 @@ class PGKVStorage(BaseKVStorage):
         elif is_namespace(self.namespace, NameSpace.KV_STORE_FULL_DOCS):
             for k, v in data.items():
                 upsert_sql = SQL_TEMPLATES["upsert_doc_full"]
+                meta_payload: dict[str, Any] = {}
+                if v.get("metadata") is not None:
+                    meta_payload["metadata"] = v.get("metadata")
+                if v.get("manual_graph") is not None:
+                    meta_payload["manual_graph"] = v.get("manual_graph")
+                if v.get("chunk_overrides") is not None:
+                    meta_payload["chunk_overrides"] = v.get("chunk_overrides")
                 _data = {
                     "id": k,
                     "content": v["content"],
                     "doc_name": v.get("file_path", ""),  # Map file_path to doc_name
+                    "meta": json.dumps(meta_payload) if meta_payload else None,
                     "workspace": self.workspace,
                 }
                 await self.db.execute(upsert_sql, _data)
@@ -4973,7 +5028,8 @@ TABLES = {
 SQL_TEMPLATES = {
     # SQL for KVStorage
     "get_by_id_full_docs": """SELECT id, COALESCE(content, '') as content,
-                                COALESCE(doc_name, '') as file_path
+                                COALESCE(doc_name, '') as file_path,
+                                meta
                                 FROM LIGHTRAG_DOC_FULL WHERE workspace=$1 AND id=$2
                             """,
     "get_by_id_text_chunks": """SELECT id, tokens, COALESCE(content, '') as content,
@@ -4989,7 +5045,8 @@ SQL_TEMPLATES = {
                                 FROM LIGHTRAG_LLM_CACHE WHERE workspace=$1 AND id=$2
                                """,
     "get_by_ids_full_docs": """SELECT id, COALESCE(content, '') as content,
-                                 COALESCE(doc_name, '') as file_path
+                                 COALESCE(doc_name, '') as file_path,
+                                 meta
                                  FROM LIGHTRAG_DOC_FULL WHERE workspace=$1 AND id = ANY($2)
                             """,
     "get_by_ids_text_chunks": """SELECT id, tokens, COALESCE(content, '') as content,
@@ -5045,11 +5102,12 @@ SQL_TEMPLATES = {
                                  FROM LIGHTRAG_RELATION_CHUNKS WHERE workspace=$1 AND id = ANY($2)
                                 """,
     "filter_keys": "SELECT id FROM {table_name} WHERE workspace=$1 AND id IN ({ids})",
-    "upsert_doc_full": """INSERT INTO LIGHTRAG_DOC_FULL (id, content, doc_name, workspace)
-                        VALUES ($1, $2, $3, $4)
+    "upsert_doc_full": """INSERT INTO LIGHTRAG_DOC_FULL (id, content, doc_name, meta, workspace)
+                        VALUES ($1, $2, $3, $4, $5)
                         ON CONFLICT (workspace,id) DO UPDATE
                            SET content = $2,
                                doc_name = $3,
+                               meta = $4,
                                update_time = CURRENT_TIMESTAMP
                        """,
     "upsert_llm_response_cache": """INSERT INTO LIGHTRAG_LLM_CACHE(workspace,id,original_prompt,return_value,chunk_id,cache_type,queryparam)
